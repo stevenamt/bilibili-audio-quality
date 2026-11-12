@@ -4,7 +4,7 @@ B 站网页播放器的音质脚本：在原生「清晰度」菜单里加一行
 
 | 脚本 | 版本 | 作用 | 大小 |
 |---|---|---|---|
-| [bilibili-audio-quality.user.js](https://stevenamt.github.io/bilibili-audio-quality/bilibili-audio-quality.user.js) | 2.0.0 | 清晰度菜单里的音质切换 | ~20 KB |
+| [bilibili-audio-quality.user.js](https://stevenamt.github.io/bilibili-audio-quality/bilibili-audio-quality.user.js) | 2.0.1 | 清晰度菜单里的音质切换 | ~20 KB |
 
 ## 安装
 
@@ -54,7 +54,6 @@ B 站网页播放器的音质脚本：在原生「清晰度」菜单里加一行
 
 - FLAC / 杜比无法原地切换：编码不同，必须换 MSE 的 SourceBuffer，只能重载
 - Linux 上的 Chrome 解不了杜比 E-AC-3，杜比档会标「无法解码」
-- 选过 FLAC 之后菜单里只剩一档，切回「自动」会重载恢复完整列表
 
 ## 原理
 

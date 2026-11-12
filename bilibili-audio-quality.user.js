@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站网页版音质选择
 // @namespace    https://github.com/stevenamt/bilibili-audio-quality
-// @version      2.0.0
+// @version      2.0.1
 // @description  在 B 站网页播放器的「清晰度」菜单里附带音质档位（自动 / 最高可用 / 标准 / 较高 / 极高 / 杜比全景声 / Hi-Res 无损）。AAC 之间不刷新页面直接换。
 // @author       stevenamt
 // @license      MIT
@@ -77,8 +77,16 @@
   // 音轨 id 到编码。拦截响应时记下来
   var CODECS = {};
 
+  // 最近一次 playurl 给的完整档位表
+  // 裁剪之前记下来，FLAC 单档模式菜单还要用它
+  var ALL = [];
+
   // dashjs 的 MediaPlayer 实例。截到才有得切
   var MP = null;
+
+  // 页面会建两个实例，第一个是空壳
+  // 每次用之前挑一个有档位表的
+  var MPS = [];
 
   // window.dashjs 本体。只为了让页面的 getter 还能读到
   var DJ = null;
@@ -195,9 +203,37 @@
         dash.dolby.audio.forEach(function (a) { if (a.id) CODECS[a.id] = a.codecs || 'ec-3'; });
       }
 
+      // 先记完整档位表。后面的裁剪会把它改小
+      // seen: 已收的 id，防止同一档出现两次
+      var seen = {};
+      var full = [];
+
+      // 手上一路音轨，塞进完整表
+      // a: 原始对象；defId / defCodec: 缺字段时的兜底
+      function keep(a, defId, defCodec) {
+        if (!a || !a.baseUrl) return;
+        var id = a.id || defId;
+        if (!id || seen[id]) return;
+        seen[id] = 1;
+        full.push({ id: id, bw: a.bandwidth || 0, codec: a.codecs || defCodec });
+      }
+
+      (dash.audio || []).forEach(function (a) { keep(a, 0, ''); });
+      if (dash.flac && dash.flac.audio) keep(dash.flac.audio, 30251, 'flac');
+      if (dash.dolby && Array.isArray(dash.dolby.audio)) {
+        dash.dolby.audio.forEach(function (a) { keep(a, 30250, 'ec-3'); });
+      }
+
+      if (full.length) {
+        ALL = full.sort(function (x, y) { return x.bw - y.bw; });
+      }
+
       // 目标是 FLAC / 杜比：直接裁成单路
-      // 播放器没得挑，首屏就播目标档，不用重建 MSE
+      // 最高可用时先解析成具体档，才知道要不要裁
       var target = selected();
+      if (target === -1) {
+        target = ALL.length ? ALL[ALL.length - 1].id : -1;
+      }
       if (target > 0 && !hot(target)) {
         var all = [];
         (dash.audio || []).forEach(function (a) { if (a && a.baseUrl) all.push(a); });
@@ -338,12 +374,30 @@
     });
   } catch (e) {}
 
+  // 挑一个真正带档位表的实例
+  // B 站先建空壳、再建真正的那个，顺序不保证
+  function pick() {
+    if (MP) {
+      try { if ((MP.getBitrateInfoListFor('audio') || []).length) return MP; } catch (e) {}
+    }
+    for (var i = MPS.length - 1; i >= 0; i--) {
+      try {
+        if ((MPS[i].getBitrateInfoListFor('audio') || []).length) {
+          MP = MPS[i];
+          return MP;
+        }
+      } catch (e) {}
+    }
+    return MP;
+  }
+
   // 档位表。每次现读，不缓存
   // 返回 [{id, bw, idx}]，顺序就是 dashjs 的顺序
   function tracks() {
-    if (!MP) return [];
+    var p = pick();
+    if (!p) return [];
     try {
-      var l = MP.getBitrateInfoListFor('audio') || [];
+      var l = p.getBitrateInfoListFor('audio') || [];
       return l.map(function (x, i) {
         return { id: +x.id, bw: x.bitrate || 0, idx: i };
       });
@@ -352,10 +406,11 @@
 
   // 现在实际在跑的档
   function nowId() {
-    if (!MP) return 0;
+    var p = pick();
+    if (!p) return 0;
     try {
-      var l = MP.getBitrateInfoListFor('audio') || [];
-      var q = MP.getQualityFor('audio');
+      var l = p.getBitrateInfoListFor('audio') || [];
+      var q = p.getQualityFor('audio');
       return l[q] ? +l[q].id : 0;
     } catch (e) { return 0; }
   }
@@ -374,12 +429,16 @@
   function apply(id, boot) {
     if (isNaN(id)) return;
 
-    var l = MP ? (MP.getBitrateInfoListFor('audio') || []) : [];
+    var p = pick();
+    var l = [];
+    try { l = p ? (p.getBitrateInfoListFor('audio') || []) : []; } catch (e) {}
 
     // 自动：不碰播放器
     if (id === 0) {
       // 上次是 FLAC 的话手上只有单档，重载才能拿回全部
       if (!boot && l.length <= 1) { savePlayback(); location.reload(); return; }
+      // 交回 ABR 自己挑
+      try { if (p) p.setAutoSwitchQualityFor('audio', true); } catch (e) {}
       AQ.applied = 0;
       return;
     }
@@ -401,6 +460,15 @@
       }
     }
 
+    // 实际要落的档。-1 时就是列表最后一个
+    var wantId = want >= 0 ? +l[want].id : id;
+
+    // 最高可用可能落在 FLAC 上，同样不能热切
+    if (!hot(wantId)) {
+      if (!boot) { savePlayback(); location.reload(); }
+      return;
+    }
+
     // 列表里没有目标档：当前 manifest 不全，重载才能拿到
     if (want < 0) {
       if (!boot) { savePlayback(); location.reload(); }
@@ -408,7 +476,7 @@
     }
 
     try {
-      MP.setQualityFor('audio', want);
+      p.setQualityFor('audio', want);
       AQ.applied = +l[want].id;
     } catch (e) {}
   }
@@ -417,6 +485,7 @@
   // p: dashjs 的 MediaPlayer
   function bind(p) {
     MP = p;
+    MPS.push(p);
 
     // 等档位表出来再落目标
     // 播放器构造完到 manifest 解析完有一小段空窗
@@ -437,10 +506,21 @@
 
   // 刷新快照。给菜单和外界看
   function refresh() {
-    AQ.list = tracks().map(function (t) {
+    var live = tracks().map(function (t) {
       var codec = CODECS[t.id] || '';
       return { id: t.id, kbps: kbps(t.bw), codec: codec, ok: canPlay(codec) };
     });
+
+    // FLAC / 杜比模式下 dashjs 手上只有一路
+    // 用 playurl 记下的完整表，菜单才切得回去
+    if (ALL.length > live.length) {
+      AQ.list = ALL.map(function (x) {
+        return { id: x.id, kbps: kbps(x.bw), codec: x.codec, ok: canPlay(x.codec) };
+      });
+      return;
+    }
+
+    AQ.list = live;
   }
 
   // ---------------------------------------------------------------- 菜单
