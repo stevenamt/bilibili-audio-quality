@@ -1,9 +1,8 @@
 // ==UserScript==
 // @name         B站网页版音质选择
-// @name:zh-CN   B站网页版音质选择
 // @namespace    https://github.com/stevenamt/bilibili-audio-quality
-// @version      1.6.0
-// @description  在 B 站网页播放器的「清晰度」菜单里附带音质档位（自动 / 最高可用 / 标准 / 较高 / 极高 / 杜比全景声 / Hi-Res 无损）。
+// @version      2.0.0
+// @description  在 B 站网页播放器的「清晰度」菜单里附带音质档位（自动 / 最高可用 / 标准 / 较高 / 极高 / 杜比全景声 / Hi-Res 无损）。AAC 之间不刷新页面直接换。
 // @author       stevenamt
 // @license      MIT
 // @homepageURL  https://github.com/stevenamt/bilibili-audio-quality
@@ -17,59 +16,72 @@
 
 /*
  * 原理
- * -----
- * B 站网页播放器没有独立的音质选项：x/player/playurl 的响应里 dash.audio 同时带多路音频，
- * 选哪一路由播放器自己决定，服务端也没有“指定音质”的参数。
- * 所以这里只做一件事：在播放器读到响应之前把 dash.audio 过滤成只剩目标那一路。
- * 三条路径都要拦：首屏内联的 window.__playinfo__、fetch、XMLHttpRequest。
+ * ----
+ * B 站把 playurl 的 dash 对象直接交给 dashjs。
+ * dash.audio 里每一路音频，dashjs 都当成一个 representation。
+ * 播放器手里本来就有全部档位，
+ * 只是界面不给你选，默认播排序第一的那一路。
+ *
+ * 换档因此有两条路：
+ *   AAC 之间：dashjs 的 setQualityFor('audio', 索引) 原地换。
+ *   不重建 MSE，位置、缓冲、画质都不动。
+ *   FLAC / 杜比：编码不同，必须换 SourceBuffer，
+ *   热切会卡死十几秒，改用重载页面 + 首屏只留目标档。
  *
  * 界面
- * -----
- * 音质选项并进原生「清晰度」菜单（同一条 li 结构），不自绘按钮和浮层：
+ * ----
+ * 音质选项并进原生「清晰度」菜单，同一条 li 结构。
  * 位置、样式、hover、全屏重定位、点外部关闭全由播放器负责。
- * 菜单里只多一行「音质 · 极高 ▸」，点进去切成音质视图再选档——
- * 直接平铺会把菜单撑到比播放器还高，小窗口下顶部的画质项会被裁掉。
+ * 菜单里只多一行「音质 · 极高 ▸」，点进去切成音质视图再选档。
  *
  * 结构
  * -----
- * 配置 → 状态 → 工具 → 取流（改响应）→ 菜单（只画 UI）→ 换档（存进度、重载）→ 交互入口
- * 取流层不碰 DOM，菜单层不碰响应；两边只通过 AQ 这个快照交换“现在有哪些档、用了哪一档”。
- *
- * 已知限制
- * --------
- * - 档位名用平台官方文案（标准 / 较高 / 极高），后面跟的数字才是接口下发的实测码率。
- * - 无损 / 杜比取决于片源和账号权限，平台不下发就没有（脚本不伪造档位）。
- * - 判断某档能不能播只看浏览器解码能力：Chrome/Linux 解不了 E-AC-3，杜比档会标「无法解码」。
+ * 配置 → 工具 → 取流（改响应）→ 引擎（切档）→ 菜单（只画 UI）
+ * → 换档与进度 → 交互
+ * 取流层不碰 DOM，菜单层不碰响应，
+ * 两边只通过 window.biliAQ 交换"现在有哪些档、用了哪一档"。
  */
 
 (function () {
   'use strict';
 
-  // 既是防重入标记，也是取流层给菜单层的快照
-  if (window.__biliAQ) return;
-  var AQ = window.__biliAQ = { all: [], applied: 0 };
+  // 防重入。同一页面只跑一份
+  if (window.biliAQ && window.biliAQ.__core) return;
+
+  // 快照
+  // list: 全部档位
+  // applied: 上一次切到的档
+  var AQ = { list: [], applied: 0 };
 
   // ---------------------------------------------------------------- 配置
 
-  var LEVEL_KEY = 'aq_level';  // 0 = 自动（不拦取流）；-1 = 最高可用；其余为音轨 id
-  var SEEK_KEY = 'aq_seek';    // 换档前的播放位置
-  var SEEK_TTL = 120000;       // 位置记录 2 分钟内有效
+  // 目标档存放的键
+  // 0 = 自动；-1 = 最高可用；正数 = 音轨 id
+  var KEY = 'aq_level';
 
-  // [音轨 id, 档位简称, 全称]。顺序即高低；id 大小和音质无关（30251 无损的 id 比 30280 小）
-  // 名字用平台官方那套（标准 / 较高 / 极高），不写标称码率：实测 30216 只有 44 kbps，
-  // 写「64K」会和同一行显示的实测值当场打架。
-  var TIERS = [
-    [30216, '标准', '标准'],
-    [30232, '较高', '较高'],
-    [30280, '极高', '极高'],
-    [30250, '杜比', '杜比全景声'],
-    [30251, '无损', 'Hi-Res 无损']
-  ];
-  var ORDER = TIERS.map(function (t) { return t[0]; });
-  var VIP_FROM = ORDER.indexOf(30250); // 从这里开始是大会员档
+  // 换档前的播放位置
+  var SEEK_KEY = 'aq_seek';
 
-  var NAMES = {};
-  TIERS.forEach(function (t) { NAMES[t[0]] = t; });
+  // 位置记录 2 分钟内有效
+  var SEEK_TTL = 120000;
+
+  // id 到平台文案。表里没有就显示 #id
+  var NAMES = {
+    30216: '标准',
+    30232: '较高',
+    30280: '极高',
+    30250: '杜比全景声',
+    30251: 'Hi-Res 无损'
+  };
+
+  // 音轨 id 到编码。拦截响应时记下来
+  var CODECS = {};
+
+  // dashjs 的 MediaPlayer 实例。截到才有得切
+  var MP = null;
+
+  // window.dashjs 本体。只为了让页面的 getter 还能读到
+  var DJ = null;
 
   // 菜单选择器与标记
   var MENU = '.bpx-player-ctrl-quality-menu';
@@ -78,25 +90,28 @@
   var SIG = 'data-aq-sig';   // 上次渲染的快照，用于幂等短路
   var STYLE_ID = 'aq-style';
 
-  // 分组标题 / 返回行共用：字号行高跟原生一致，只把颜色压暗、加一条分隔线
+  // 分组标题 / 返回行共用：字号行高跟原生一致，只把颜色压暗
   var HEAD_STYLE = 'list-style:none;cursor:pointer;padding:6px 12px;' +
     'font-size:11px;line-height:18px;color:rgba(255,255,255,.55);' +
     'border-top:1px solid rgba(255,255,255,.09)';
 
   // ---------------------------------------------------------------- 工具
 
-  function name(id, full) {
-    var t = NAMES[id];
-    if (t) return full ? t[2] : t[1];
-    if (id === -1) return '最高可用'; // 不是音轨 id，不能落到 '#' 兜底
-    return id ? '#' + id : '自动';
+  // id 转名字
+  // id: 音轨 id，-1 是最高可用，0 是自动
+  function name(id) {
+    if (id === -1) return '最高可用';
+    return NAMES[id] || (id ? '#' + id : '自动');
   }
 
-  function kbps(stream) {
-    return Math.round(((stream && stream.bandwidth) || 0) / 1000);
+  // 字节转 kbps，取整
+  // bw: 带宽字节数
+  function kbps(bw) {
+    return Math.round((bw || 0) / 1000);
   }
 
-  // 浏览器能不能解这个音频编码。MediaSource 缺失时按可播处理，别误杀
+  // 浏览器能不能解这个编码
+  // codec: 形如 mp4a.40.2 / flac / ec-3
   function canPlay(codec) {
     try {
       if (!codec || !window.MediaSource) return true;
@@ -104,96 +119,117 @@
     } catch (e) { return true; }
   }
 
+  // 读目标档
   function selected() {
     try {
-      var n = parseInt(localStorage.getItem(LEVEL_KEY), 10);
+      var n = parseInt(localStorage.getItem(KEY), 10);
       return isNaN(n) ? 0 : n;
     } catch (e) { return 0; }
   }
 
+  // 写目标档
+  // id: 同 KEY 的取值
   function save(id) {
-    try { localStorage.setItem(LEVEL_KEY, String(id)); } catch (e) {}
+    try { localStorage.setItem(KEY, String(id)); } catch (e) {}
   }
 
   // ---------------------------------------------------------------- 取流
 
-  // 把普通 / 无损 / 杜比三处音频合成一张表，按档位高低排序
-  function collect(dash) {
-    var list = [];
-
-    function add(a, defId, defCodec) {
-      if (!a) return;
-      list.push({ id: a.id || defId, kbps: kbps(a), codec: a.codecs || defCodec, raw: a });
-    }
-
-    (dash.audio || []).forEach(function (a) { add(a, a.id, ''); });
-
-    var flac = dash.flac && dash.flac.audio; // 无损是单个对象
-    if (flac && flac.baseUrl) add(flac, 30251, 'flac');
-
-    var dolby = dash.dolby && dash.dolby.audio; // 杜比是数组
-    if (Array.isArray(dolby)) dolby.forEach(function (a) { add(a, 30250, 'ec-3'); });
-
-    return list.sort(function (x, y) { return ORDER.indexOf(x.id) - ORDER.indexOf(y.id); });
+  // 找 dash。三个位置都试
+  // json: playurl 的整个响应
+  // 投稿页在 data.dash，番剧在 result.dash
+  // 有的接口嵌在 result.video_info.dash
+  function findDash(json) {
+    if (!json || typeof json !== 'object') return null;
+    return (json.data && json.data.dash)
+      || (json.result && json.result.dash)
+      || (json.result && json.result.video_info && json.result.video_info.dash)
+      || null;
   }
 
-  // 挑一路：目标档在就精确命中；不在就退到不高于它的最高普通档；-1 取能播的最高档
-  function choose(list, target) {
-    var playable = list.filter(function (x) { return canPlay(x.codec); });
-    if (!playable.length) return list[list.length - 1];
-    if (target === -1) return playable[playable.length - 1];
+  // 把 FLAC 和杜比并进 dash.audio
+  // dash: playurl 里的 dash 对象
+  // 原字段保留，只往 audio 数组里追加
+  // dashjs 每多一个对象，就多一路可选档
+  function merge(dash) {
+    // 待并入的音轨
+    var extra = [];
 
-    // 精确命中优先。少了这一步，选「无损」会被下面的 VIP_FROM 挡掉、退成极高档
-    for (var i = 0; i < playable.length; i++) {
-      if (playable[i].id === target) return playable[i];
+    // 无损是单个对象
+    var flac = dash.flac && dash.flac.audio;
+    if (flac && flac.baseUrl) extra.push(flac);
+
+    // 杜比是数组
+    var dolby = dash.dolby && dash.dolby.audio;
+    if (Array.isArray(dolby)) {
+      dolby.forEach(function (a) { if (a && a.baseUrl) extra.push(a); });
     }
 
-    // 目标档没下发：退到不高于它的最高普通档；比最低档还低（或目标 id 不在表里）就取最低档
-    var want = ORDER.indexOf(target);
-    if (want > -1) {
-      for (var j = playable.length - 1; j >= 0; j--) {
-        var idx = ORDER.indexOf(playable[j].id);
-        if (idx > -1 && idx <= want && idx < VIP_FROM) return playable[j];
-      }
-    }
-    return playable[0];
+    if (!extra.length) return;
+
+    dash.audio = dash.audio || [];
+
+    // 已有的 id，避免重复追加
+    var have = {};
+    dash.audio.forEach(function (a) { have[a.id] = 1; });
+
+    extra.forEach(function (a) {
+      if (have[a.id]) return;
+      dash.audio.push(a);
+    });
   }
 
-  // 改响应：只留目标那一路，并把无损 / 杜比字段清空，免得播放器绕过去
+  // 处理一份 playurl 响应
+  // json: 整个响应，原地改，返回同一个对象
   function handle(json) {
     try {
-      var dash = json && json.data && json.data.dash;
+      var dash = findDash(json);
       if (!dash) return json;
 
-      var list = collect(dash);
-      if (!list.length) return json;
+      // 记编码，给 canPlay / hot 用
+      (dash.audio || []).forEach(function (a) { if (a.id) CODECS[a.id] = a.codecs || ''; });
+      if (dash.flac && dash.flac.audio && dash.flac.audio.id) {
+        CODECS[dash.flac.audio.id] = 'flac';
+      }
+      if (dash.dolby && Array.isArray(dash.dolby.audio)) {
+        dash.dolby.audio.forEach(function (a) { if (a.id) CODECS[a.id] = a.codecs || 'ec-3'; });
+      }
 
+      // 目标是 FLAC / 杜比：直接裁成单路
+      // 播放器没得挑，首屏就播目标档，不用重建 MSE
       var target = selected();
-      var applied = 0;
+      if (target > 0 && !hot(target)) {
+        var all = [];
+        (dash.audio || []).forEach(function (a) { if (a && a.baseUrl) all.push(a); });
+        if (dash.flac && dash.flac.audio && dash.flac.audio.baseUrl) all.push(dash.flac.audio);
+        if (dash.dolby && Array.isArray(dash.dolby.audio)) {
+          dash.dolby.audio.forEach(function (a) { if (a && a.baseUrl) all.push(a); });
+        }
 
-      if (target) {
-        var hit = choose(list, target);
+        var hit = null;
+        all.forEach(function (a) { if (a.id === target) hit = a; });
+
         if (hit) {
-          dash.audio = [hit.raw]; // 只留一路，播放器没得挑
+          dash.audio = [hit];
           dash.dolby = { type: 0, audio: null };
           dash.flac = { display: false, audio: null };
-          applied = hit.id;
+          return json;
         }
       }
 
-      AQ.all = list.map(function (x) {
-        return { id: x.id, kbps: x.kbps, codec: x.codec, ok: canPlay(x.codec) };
-      });
-      AQ.applied = applied;
+      merge(dash);
     } catch (e) {}
     return json;
   }
 
+  // 判断是不是 playurl 接口
+  // url: 请求地址
   function isPlayurl(url) {
     return typeof url === 'string' && url.indexOf('playurl') > -1;
   }
 
   // 1) 首屏内联数据
+  // document-start 抢在页面脚本前
   var inline;
   try {
     Object.defineProperty(window, '__playinfo__', {
@@ -223,7 +259,7 @@
     };
   }
 
-  // 3) XMLHttpRequest：send 之前注册 readystatechange，早于播放器读取
+  // 3) XHR。切画质走这条
   var rawOpen = XMLHttpRequest.prototype.open;
   var rawSend = XMLHttpRequest.prototype.send;
 
@@ -241,8 +277,11 @@
         patched = true;
         try {
           var text = JSON.stringify(handle(JSON.parse(xhr.responseText)));
-          Object.defineProperty(xhr, 'responseText', { get: function () { return text; }, configurable: true });
-          // responseType 是 json 时调用方要的是对象，塞字符串会让它读 undefined
+          Object.defineProperty(xhr, 'responseText', {
+            get: function () { return text; },
+            configurable: true
+          });
+          // responseType 是 json 时调用方要对象
           Object.defineProperty(xhr, 'response', {
             configurable: true,
             get: function () {
@@ -257,6 +296,152 @@
     }
     return rawSend.apply(this, arguments);
   };
+
+  // ---------------------------------------------------------------- 引擎
+
+  // 截 dashjs 实例
+  // 页面把 dashjs 赋值到 window 时才能拿到
+  // 轮询会错过第一次构造，必须用 setter
+  function arm(v) {
+    if (!v || typeof v !== 'object') return;
+    try {
+      var F = v.MediaPlayer;
+      if (typeof F !== 'function' || F.__aqWrapped) return;
+
+      // 包一层工厂，create() 的返回值就是实例
+      var wrapped = function () {
+        var inst = F.apply(this, arguments);
+        try {
+          var rawCreate = inst.create;
+          inst.create = function () {
+            var p = rawCreate.apply(this, arguments);
+            bind(p);
+            return p;
+          };
+        } catch (e) {}
+        return inst;
+      };
+
+      for (var k in F) {
+        try { wrapped[k] = F[k]; } catch (e) {}
+      }
+      wrapped.__aqWrapped = true;
+      v.MediaPlayer = wrapped;
+    } catch (e) {}
+  }
+
+  try {
+    Object.defineProperty(window, 'dashjs', {
+      configurable: true,
+      get: function () { return DJ; },
+      set: function (v) { DJ = v; arm(v); }
+    });
+  } catch (e) {}
+
+  // 档位表。每次现读，不缓存
+  // 返回 [{id, bw, idx}]，顺序就是 dashjs 的顺序
+  function tracks() {
+    if (!MP) return [];
+    try {
+      var l = MP.getBitrateInfoListFor('audio') || [];
+      return l.map(function (x, i) {
+        return { id: +x.id, bw: x.bitrate || 0, idx: i };
+      });
+    } catch (e) { return []; }
+  }
+
+  // 现在实际在跑的档
+  function nowId() {
+    if (!MP) return 0;
+    try {
+      var l = MP.getBitrateInfoListFor('audio') || [];
+      var q = MP.getQualityFor('audio');
+      return l[q] ? +l[q].id : 0;
+    } catch (e) { return 0; }
+  }
+
+  // 目标档能不能热切
+  // 只有 AAC 之间是同一个 SourceBuffer，能原地换
+  // FLAC / 杜比要换编码，dashjs 必然重建 MSE，中断十几秒
+  function hot(id) {
+    var c = CODECS[id] || '';
+    return !c || /mp4a|aac/i.test(c);
+  }
+
+  // 把目标档落到播放器
+  // id: 0 自动 / -1 最高 / 正数音轨 id
+  // boot: true 表示首屏调用，此时不许重载，否则死循环
+  function apply(id, boot) {
+    if (isNaN(id)) return;
+
+    var l = MP ? (MP.getBitrateInfoListFor('audio') || []) : [];
+
+    // 自动：不碰播放器
+    if (id === 0) {
+      // 上次是 FLAC 的话手上只有单档，重载才能拿回全部
+      if (!boot && l.length <= 1) { savePlayback(); location.reload(); return; }
+      AQ.applied = 0;
+      return;
+    }
+
+    // 非 AAC 档：换编码必须重建 MSE，走重载让首屏直接取
+    if (id > 0 && !hot(id)) {
+      if (!boot) { savePlayback(); location.reload(); }
+      return;
+    }
+
+    if (!l.length) return;
+
+    var want = -1;
+    if (id === -1) {
+      want = l.length - 1;
+    } else {
+      for (var i = 0; i < l.length; i++) {
+        if (+l[i].id === id) want = i;
+      }
+    }
+
+    // 列表里没有目标档：当前 manifest 不全，重载才能拿到
+    if (want < 0) {
+      if (!boot) { savePlayback(); location.reload(); }
+      return;
+    }
+
+    try {
+      MP.setQualityFor('audio', want);
+      AQ.applied = +l[want].id;
+    } catch (e) {}
+  }
+
+  // 实例就绪
+  // p: dashjs 的 MediaPlayer
+  function bind(p) {
+    MP = p;
+
+    // 等档位表出来再落目标
+    // 播放器构造完到 manifest 解析完有一小段空窗
+    var tries = 0;
+    var timer = setInterval(function () {
+      var l = [];
+      try { l = p.getBitrateInfoListFor('audio') || []; } catch (e) {}
+
+      if (l.length) {
+        clearInterval(timer);
+        apply(selected(), true);
+        refresh();
+      } else if (++tries > 60) {
+        clearInterval(timer);
+      }
+    }, 250);
+  }
+
+  // 刷新快照。给菜单和外界看
+  function refresh() {
+    AQ.list = tracks().map(function (t) {
+      var codec = CODECS[t.id] || '';
+      return { id: t.id, kbps: kbps(t.bw), codec: codec, ok: canPlay(codec) };
+    });
+  }
 
   // ---------------------------------------------------------------- 菜单
 
@@ -273,19 +458,6 @@
     (document.head || document.documentElement).appendChild(style);
   }
 
-  // 实际在跑的那一路：分片 URL 形如 xxx-1-30280.m4s，取最近出现的一条。
-  // 选「自动」或「最高可用」时，播放器实际挑的可能不是你以为的那档，入口行要如实显示
-  function runningId() {
-    try {
-      var entries = performance.getEntriesByType('resource');
-      for (var i = entries.length - 1, n = 0; i >= 0 && n < 200; i--, n++) {
-        var m = /-(\d{5})\.m4s/.exec(entries[i].name);
-        if (m && ORDER.indexOf(+m[1]) > -1) return +m[1];
-      }
-    } catch (e) {}
-    return 0;
-  }
-
   // 菜单数据：自动 / 最高可用 / 实际下发的每一档
   function rows() {
     var cur = selected();
@@ -294,11 +466,11 @@
       { id: -1, text: '最高可用', on: cur === -1 }
     ];
 
-    AQ.all.forEach(function (a) {
+    AQ.list.forEach(function (a) {
       var rate = a.kbps ? ' · ' + a.kbps + ' kbps' : '';
       out.push({
         id: a.id,
-        text: name(a.id, true) + rate + (a.ok ? '' : '（无法解码）'),
+        text: name(a.id) + rate + (a.ok ? '' : '（无法解码）'),
         on: cur === a.id,
         off: !a.ok
       });
@@ -322,9 +494,10 @@
 
   // 收起态：只多一行入口，显示当前实际在用的档
   function entryRows() {
-    var id = runningId() || AQ.applied || selected();
-    var label = id > 0 ? name(id, true) : (selected() === -1 ? '最高可用' : '自动');
-    if (!AQ.all.length) label = '读取中';
+    var n = nowId();
+    var t = selected();
+    var label = n > 0 ? name(n) : (t === -1 ? '最高可用' : '自动');
+    if (!AQ.list.length) label = '读取中';
     return [item('音质 · ' + label + ' ▸', 'head', '', HEAD_STYLE)];
   }
 
@@ -342,11 +515,13 @@
     return out;
   }
 
-  // 幂等：菜单开关、换档、切清晰度后都会重跑；内容和上次一样就直接返回
+  // 幂等：菜单开关、换档、切清晰度后都会重跑；内容一样就直接返回
   function inject() {
     var ul = menuEl();
     if (!ul) return;
     ensureStyle();
+
+    refresh();
 
     var view = ul.getAttribute(VIEW) || 'quality';
     var list = rows();
@@ -369,7 +544,8 @@
 
   // ------------------------------------------------------------ 换档与进度
 
-  // 换档只能重载页面，视频会回到起点。把时间点临时存进 sessionStorage，重载后 seek 回去
+  // 换档只能重载时，视频会回到起点
+  // 把时间点临时存进 sessionStorage，重载后 seek 回去
   function savePlayback() {
     try {
       var v = document.querySelector('video');
@@ -400,13 +576,6 @@
     }, 250);
   }
 
-  function apply(id) {
-    if (isNaN(id)) return;
-    save(id);
-    savePlayback();
-    location.reload();
-  }
-
   // ---------------------------------------------------------------- 交互
 
   // 播放器对菜单有事件委托，条目点下去会顺带触发画质切换，所以在捕获阶段拦掉
@@ -429,11 +598,13 @@
       ul.setAttribute(VIEW, 'quality');
       inject();
     } else if (!li.hasAttribute('data-off')) {
-      apply(parseInt(mark, 10));
+      save(parseInt(mark, 10));
+      apply(parseInt(mark, 10), false);
+      inject();
     }
   }, true);
 
-  // 菜单是常驻节点，但取流完成前只有画质项；盯住 DOM，一变就补一次，空闲时不消耗。
+  // 菜单是常驻节点，但取流完成前只有画质项；盯住 DOM，一变就补一次，空闲时不消耗
   // document-start 时 documentElement 可能还是 null，observe 会抛错并把后面注册一起带崩
   var watching = false;
   function watch() {
@@ -463,4 +634,31 @@
     watch();
     inject();
   }
+
+  // ---------------------------------------------------------------- 对外
+
+  window.biliAQ = {
+    __core: true,
+
+    // 全部档位
+    list: function () { refresh(); return AQ.list.slice(); },
+
+    // 换档。AAC 之间热切，FLAC / 杜比走重载
+    // id: 0 自动 / -1 最高 / 正数音轨 id
+    set: function (id) {
+      if (isNaN(id)) return;
+      save(id);
+      apply(id, false);
+      refresh();
+    },
+
+    // 实际在跑的档
+    now: nowId,
+
+    // 目标档
+    target: selected,
+
+    // 目标档文案
+    label: function () { return name(selected()); }
+  };
 })();
