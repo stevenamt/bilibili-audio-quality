@@ -4,7 +4,7 @@ B 站网页播放器的音质脚本：在原生「清晰度」菜单里加一行
 
 | 脚本 | 版本 | 作用 | 大小 |
 |---|---|---|---|
-| [bilibili-audio-quality.user.js](https://stevenamt.github.io/bilibili-audio-quality/bilibili-audio-quality.user.js) | 2.0.3 | 清晰度菜单里的音质切换 | ~16 KB |
+| [bilibili-audio-quality.user.js](https://stevenamt.github.io/bilibili-audio-quality/bilibili-audio-quality.user.js) | 2.0.4 | 清晰度菜单里的音质切换 | ~16 KB |
 
 ## 安装
 

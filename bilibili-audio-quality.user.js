@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站网页版音质选择
 // @namespace    https://github.com/stevenamt/bilibili-audio-quality
-// @version      2.0.3
+// @version      2.0.4
 // @description  在 B 站网页播放器的「清晰度」菜单里附带音质档位（自动 / 最高可用 / 标准 / 较高 / 极高 / 杜比全景声 / Hi-Res 无损）。选档后重载页面，播放位置自动恢复。
 // @author       stevenamt
 // @license      MIT
@@ -197,7 +197,12 @@
       dash.audio = [hit.raw];
       dash.dolby = { type: 0, audio: null };
       dash.flac = { display: false, audio: null };
-    } catch (e) {}
+    } catch (e) {
+    } finally {
+      // 档位表变了，菜单要跟着更新
+      // 取流层只发通知，不碰 DOM
+      setTimeout(inject, 0);
+    }
     return json;
   }
 
@@ -449,36 +454,25 @@
     }
   }, true);
 
-  // 菜单是常驻节点，但取流完成前只有画质项；盯住 DOM，一变就补一次，空闲时不消耗
-  // document-start 时 documentElement 可能还是 null，observe 会抛错并把后面注册一起带崩
-  var watching = false;
-  function watch() {
-    if (watching || !document.documentElement) return;
-    watching = true;
-    var queued = false;
-    new MutationObserver(function () {
-      if (queued) return;
-      queued = true;
-      setTimeout(function () { queued = false; inject(); }, 120);
-    }).observe(document.documentElement, { childList: true, subtree: true });
-  }
+  // 菜单节点常驻，打开菜单不会重建它
+  // 只有切清晰度 / 换 P 时播放器重写 li，这几处都有现成信号：
+  //   handle() 拿到新档位表、loadedmetadata、全屏切换
+  // 再补一条鼠标移到「清晰度」上，兜住漏掉的场景
+  // 不用 MutationObserver：全文档观察一秒几十次回调，全是弹幕和推荐列表
+  document.addEventListener('mouseover', function (e) {
+    var t = e.target;
+    if (t && t.closest && t.closest('.bpx-player-ctrl-quality')) inject();
+  }, true);
 
   // 切清晰度 / 换 P 之后会重新取流，菜单里的档位要跟着变
   document.addEventListener('loadedmetadata', function () { setTimeout(inject, 500); }, true);
   document.addEventListener('fullscreenchange', function () { setTimeout(inject, 300); });
 
   restorePlayback();
-  watch();
 
-  document.addEventListener('DOMContentLoaded', function () {
-    watch();
-    inject();
-  });
+  document.addEventListener('DOMContentLoaded', inject);
 
-  if (document.readyState !== 'loading') {
-    watch();
-    inject();
-  }
+  if (document.readyState !== 'loading') inject();
 
   // ---------------------------------------------------------------- 对外
 
