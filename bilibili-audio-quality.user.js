@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站网页版音质选择
 // @namespace    https://github.com/stevenamt/bilibili-audio-quality
-// @version      2.0.1
+// @version      2.0.2
 // @description  在 B 站网页播放器的「清晰度」菜单里附带音质档位（自动 / 最高可用 / 标准 / 较高 / 极高 / 杜比全景声 / Hi-Res 无损）。AAC 之间不刷新页面直接换。
 // @author       stevenamt
 // @license      MIT
@@ -9,7 +9,7 @@
 // @supportURL   https://github.com/stevenamt/bilibili-audio-quality/issues
 // @updateURL    https://stevenamt.github.io/bilibili-audio-quality/bilibili-audio-quality.user.js
 // @downloadURL  https://stevenamt.github.io/bilibili-audio-quality/bilibili-audio-quality.user.js
-// @match        https://www.bilibili.com/*
+// @match        https://www.bilibili.com/video/*
 // @run-at       document-start
 // @grant        none
 // ==/UserScript==
